@@ -1,0 +1,104 @@
+name: seal-build
+
+# Build-and-pack only: the test suite runs on Travis (.travis.yml).
+# Every shipped bundle is regenerated from src/ with upstream's Gruntfile
+# (the `release` task minus its lint+test `default` step) on Node 0.12,
+# the toolchain the 2.10.2 release was cut with.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild bundles from src/ (grunt transpile update-index component uglify:main)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w -e NODE_TLS_REJECT_UNAUTHORIZED=0 node:0.12 bash -ec '
+            node --version; npm --version
+            npm install
+            # grunt-contrib-uglify 0.8.1 + uglify-js 2.4.17 reproduce the published min/*.min.js
+            npm install grunt-cli@0.1.13 grunt-contrib-uglify@0.8.1 uglify-js@2.4.17
+            node_modules/.bin/grunt transpile update-index component uglify:main
+            chown -R '"$(id -u):$(id -g)"' .
+          '
+          git status --short -- moment.js locale min component.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Stage and pack
+        run: |
+          bash scripts/seal_prepublish.sh
+          npm pack ./output_build/
+          mkdir -p seal-dist
+          mv moment-2.10.2.tgz seal-dist/
+
+      - name: Check shipped bundles match src/ fixes
+        run: |
+          rm -rf /tmp/seal-check && mkdir -p /tmp/seal-check
+          tar xzf seal-dist/moment-2.10.2.tgz -C /tmp/seal-check
+          node - /tmp/seal-check/package <<'EOF'
+          var fs = require('fs'), path = require('path');
+          var pkg = process.argv[2];
+          var bundles = ['moment.js', 'min/moment.min.js',
+              'min/moment-with-locales.js', 'min/moment-with-locales.min.js'];
+          var fixes = [
+              {id: 'CVE-2016-4055', src: 'src/lib/duration/create.js',
+               marker: '/^(\\-)?(?:(\\d*)\\.)?(\\d+)\\:(\\d+)(?:\\:(\\d+)\\.?(\\d{3})?\\d*)?$/'},
+              {id: 'CVE-2017-18214', src: 'src/lib/parse/regex.js',
+               marker: '[0-9]{0,256}'},
+              {id: 'CVE-2026-17495', src: 'src/lib/locale/locales.js',
+               marker: '/^[a-z0-9]+(?:-[a-z0-9]+)*$/', near: 'string'}
+          ];
+          var oldCheck = '^[^/\\\\\\\\]*$';
+          var failed = false;
+          function fail(msg) { console.log('FAIL: ' + msg); failed = true; }
+          function hasFix(text, f) {
+              var i = text.indexOf(f.marker);
+              while (i !== -1) {
+                  if (!f.near || text.slice(Math.max(0, i - 60), i).indexOf(f.near) !== -1) {
+                      return true;
+                  }
+                  i = text.indexOf(f.marker, i + 1);
+              }
+              return false;
+          }
+          var texts = {};
+          bundles.forEach(function (b) {
+              var p = path.join(pkg, b);
+              if (!fs.existsSync(p)) { fail(b + ' missing from tarball'); texts[b] = ''; return; }
+              texts[b] = fs.readFileSync(p, 'utf8');
+          });
+          fixes.forEach(function (f) {
+              var inSrc = hasFix(fs.readFileSync(f.src, 'utf8'), f);
+              console.log(f.id + ': fix ' + (inSrc ? 'present' : 'absent') + ' in ' + f.src);
+              bundles.forEach(function (b) {
+                  var inBundle = hasFix(texts[b], f);
+                  console.log('  ' + b + ': ' + (inBundle ? 'carries' : 'lacks') + ' marker');
+                  if (inBundle !== inSrc) { fail(b + ' does not match src/ for ' + f.id); }
+              });
+          });
+          var srcLocales = fs.readFileSync('src/lib/locale/locales.js', 'utf8');
+          var oldInSrc = srcLocales.indexOf(oldCheck) !== -1;
+          var patched17495 = hasFix(srcLocales, fixes[2]);
+          console.log('old locale-name check ' + (oldInSrc ? 'present' : 'absent') + ' in src');
+          bundles.forEach(function (b) {
+              var oldInBundle = texts[b].indexOf(oldCheck) !== -1;
+              console.log('  ' + b + ': ' + (oldInBundle ? 'carries' : 'lacks') + ' old check');
+              if (oldInBundle !== oldInSrc) { fail(b + ' old locale-name check does not match src/'); }
+              if (patched17495 && oldInBundle) { fail(b + ' still carries the old locale-name check'); }
+          });
+          if (failed) { process.exit(1); }
+          console.log('bundle check passed');
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moment-2.10.2
+          path: seal-dist/moment-2.10.2.tgz
+          if-no-files-found: error
