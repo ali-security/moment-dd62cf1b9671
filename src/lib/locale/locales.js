@@ -37,20 +37,37 @@ function chooseLocale(names) {
     return null;
 }
 
+function isLocaleNameSane(name) {
+    // Only canonical locale module names are safe to append to the require path.
+    return typeof name === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name);
+}
+
 function loadLocale(name) {
-    var oldLocale = null;
+    var oldLocale = null,
+        normalizedName;
+
+    // Preserve exact custom locale names before trying the canonical built-in name.
+    if (locales[name]) {
+        return locales[name];
+    }
+
+    normalizedName = normalizeLocale(name);
+    if (locales[normalizedName]) {
+        return locales[normalizedName];
+    }
+
     // TODO: Find a better way to register and load all the locales in Node
-    if (!locales[name] && typeof module !== 'undefined' &&
-            module && module.exports) {
+    if (typeof module !== 'undefined' &&
+            module && module.exports && isLocaleNameSane(normalizedName)) {
         try {
             oldLocale = globalLocale._abbr;
-            require('./locale/' + name);
+            require('./locale/' + normalizedName);
             // because defineLocale currently also sets the global locale, we
             // want to undo that for lazy loaded locales
             getSetGlobalLocale(oldLocale);
         } catch (e) { }
     }
-    return locales[name];
+    return locales[normalizedName];
 }
 
 // This function will load locale and then set the global locale.  If
